@@ -1,0 +1,21 @@
+[
+  { "sales": 100000, "oyako_g": 3846, "gokujo_g": 1010, "karaage_pack": 2.1 },
+  { "sales": 120000, "oyako_g": 4615, "gokujo_g": 1212, "karaage_pack": 2.5 },
+  { "sales": 140000, "oyako_g": 5385, "gokujo_g": 1414, "karaage_pack": 2.9 },
+  { "sales": 160000, "oyako_g": 6154, "gokujo_g": 1616, "karaage_pack": 3.3 },
+  { "sales": 180000, "oyako_g": 6923, "gokujo_g": 1818, "karaage_pack": 3.8 },
+  { "sales": 200000, "oyako_g": 7692, "gokujo_g": 2020, "karaage_pack": 4.2 },
+  { "sales": 400000, "oyako_g": 13889, "gokujo_g": 4000, "karaage_pack": 7.6 },
+  { "sales": 450000, "oyako_g": 15625, "gokujo_g": 4500, "karaage_pack": 8.6 },
+  { "sales": 500000, "oyako_g": 17361, "gokujo_g": 5000, "karaage_pack": 9.6 },
+  { "sales": 550000, "oyako_g": 19097, "gokujo_g": 5500, "karaage_pack": 10.5 },
+  { "sales": 600000, "oyako_g": 20833, "gokujo_g": 6000, "karaage_pack": 11.5 },
+  { "sales": 650000, "oyako_g": 22569, "gokujo_g": 6500, "karaage_pack": 12.4 },
+  { "sales": 700000, "oyako_g": 24305, "gokujo_g": 7000, "karaage_pack": 13.4 },
+  { "sales": 750000, "oyako_g": 26042, "gokujo_g": 7500, "karaage_pack": 14.3 },
+  { "sales": 800000, "oyako_g": 27778, "gokujo_g": 8000, "karaage_pack": 15.3 },
+  { "sales": 850000, "oyako_g": 29514, "gokujo_g": 8500, "karaage_pack": 16.3 },
+  { "sales": 900000, "oyako_g": 31250, "gokujo_g": 9000, "karaage_pack": 17.2 },
+  { "sales": 950000, "oyako_g": 32986, "gokujo_g": 9500, "karaage_pack": 18.2 },
+  { "sales": 1000000, "oyako_g": 34772, "gokujo_g": 10000, "karaage_pack": 19.1 }
+]
