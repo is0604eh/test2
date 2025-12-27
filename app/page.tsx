@@ -1,497 +1,570 @@
+// app/page.tsx
 "use client";
 
-import { useState, ChangeEvent } from "react";
+import { useEffect, useMemo, useState } from "react";
+import {
+  calcForType,
+  type UsageRow,
+  type WeatherKind,
+  type TargetDay,
+} from "../src/lib/calcForType";
 
-// ===== 定数 =====
-const OYAKO_PACK_GRAM = 1000; // 1パックあたりのグラム数（必要なら変更）
-const GOKUJO_PACK_GRAM = 1000; // 1パックあたりのグラム数（必要なら変更）
+// ★現場換算（答え合わせのキー：必要なら調整）
+const OYAKO_PACK_GRAM = 2000;
+const GOKUJO_PACK_GRAM = 2500;
+const KARAAGE_NEED_FACTOR = 0.9;
 
-// ===== 型定義 =====
-interface Inputs {
-  todayActualSales: string;
-  todayPredSales: string;
-  tomorrowSales: string;
-  dayAfterSales: string;
-  thawedOyako: string;
-  thawedGokujo: string;
-  thawedKaraage: string;
+const daysJP = ["日", "月", "火", "水", "木", "金", "土"];
+
+const weatherLabel: Record<WeatherKind, string> = {
+  sun: "晴",
+  cloud: "曇",
+  rain: "雨",
+  snow: "雪",
+  storm: "荒",
+  unknown: "不明",
+};
+
+// ===== number format utils（カンマ対応）=====
+const parseNum = (v: string): number => {
+  if (!v) return 0;
+  const n = Number(v.replace(/,/g, "").trim());
+  return Number.isFinite(n) ? n : 0;
+};
+
+const fmtComma = (n: number): string => {
+  if (!Number.isFinite(n)) return "0";
+  return n.toLocaleString("ja-JP");
+};
+
+const safeNum = (v: any, fallback = 0): number => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+};
+
+// ===== 祝日API =====
+// Holidays JP API: https://holidays-jp.github.io/api/v1/date.json
+type HolidayMap = Record<string, string>; // "YYYY-MM-DD": "祝日名"
+
+async function fetchHolidaysJP(): Promise<HolidayMap> {
+  const res = await fetch("https://holidays-jp.github.io/api/v1/date.json", {
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(`holiday api failed: ${res.status}`);
+  const data = (await res.json()) as HolidayMap;
+  return data && typeof data === "object" ? data : {};
 }
 
-interface UsageRow {
-  sales: number;
-  oyako_g: number;
-  gokujo_g: number;
-  karaage_pack: number;
+const toISODate = (d: Date) => d.toISOString().slice(0, 10);
+
+function addDays(base: Date, n: number) {
+  const d = new Date(base);
+  d.setDate(d.getDate() + n);
+  return d;
 }
 
-interface CalcDetail {
-  todayPredPack: number;
-  todaySoFarPack: number;
-  remainingTodayUse: number;
-  leftoverEndOfDay: number;
-  tomorrowNeed: number;
-  dayAfterNeed: number;
+function md(d: Date) {
+  return `${d.getMonth() + 1}/${d.getDate()}`;
 }
 
-interface ResultDetail {
-  pack: number;
-  gram: number;
-  detail: CalcDetail;
-}
-
-interface Results {
-  oyako: ResultDetail;
-  gokujo: ResultDetail;
-  karaage: ResultDetail;
-}
-
-// ===== 数値フォーマット（3桁カンマ） =====
-function formatNumberComma(value: string): string {
-  const num = value.replace(/,/g, "");
-  if (!num || isNaN(Number(num)))
-    return num === "" ? "" : value.replace(/[^\d,]/g, "");
-  return Number(num).toLocaleString();
-}
-
-// ===== カンマを外して数値に変換 =====
-function parseNumber(value: string): number {
-  if (!value) return 0;
-  return Number(value.replace(/,/g, ""));
-}
-
-// ===== 使用量テーブルから線形補間で使用量を取得 =====
-function getUsageBySales(
-  sales: number,
-  type: "oyako" | "gokujo" | "karaage",
-  usageData: UsageRow[]
-): { gram: number; pack: number } {
-  if (!usageData.length || isNaN(sales)) return { gram: 0, pack: 0 };
-
-  const sorted = [...usageData].sort((a, b) => a.sales - b.sales);
-
-  // 範囲外は端の値を使う
-  if (sales <= sorted[0].sales) return convertUsage(sorted[0], type);
-  if (sales >= sorted[sorted.length - 1].sales)
-    return convertUsage(sorted[sorted.length - 1], type);
-
-  // 挟む2点を探す
-  let lower = sorted[0];
-  let upper = sorted[sorted.length - 1];
-
-  for (let i = 0; i < sorted.length - 1; i++) {
-    if (sorted[i].sales <= sales && sales <= sorted[i + 1].sales) {
-      lower = sorted[i];
-      upper = sorted[i + 1];
-      break;
-    }
+// ===== 曜日ルール（基本）=====
+function baseOffsetsByWeekday(dow: number): number[] {
+  // 0=日..6=土
+  switch (dow) {
+    case 1: // 月 -> 火
+    case 2: // 火 -> 水
+    case 3: // 水 -> 木
+    case 0: // 日 -> 月
+      return [1];
+    case 4: // 木 -> 金 + 土
+      return [1, 2];
+    case 5: // 金 -> 日（基本）
+      return [2];
+    case 6: // 土 -> 日
+      return [1];
+    default:
+      return [1];
   }
-
-  const rate = (sales - lower.sales) / (upper.sales - lower.sales || 1); // 0除算回避
-
-  return convertUsageInterpolated(lower, upper, type, rate);
 }
 
-// ===== 補間なし（テーブルそのまま） =====
-function convertUsage(row: UsageRow, type: "oyako" | "gokujo" | "karaage") {
-  if (type === "oyako")
-    return { gram: row.oyako_g, pack: row.oyako_g / OYAKO_PACK_GRAM };
-
-  if (type === "gokujo")
-    return { gram: row.gokujo_g, pack: row.gokujo_g / GOKUJO_PACK_GRAM };
-
-  // 唐揚げは pack だけ管理
-  return { gram: 0, pack: row.karaage_pack };
+function uniqSorted(nums: number[]) {
+  return Array.from(new Set(nums)).sort((a, b) => a - b);
 }
 
-// ===== 補間あり =====
-function convertUsageInterpolated(
-  lower: UsageRow,
-  upper: UsageRow,
-  type: "oyako" | "gokujo" | "karaage",
-  rate: number
-) {
-  if (type === "oyako") {
-    const gram = lower.oyako_g + (upper.oyako_g - lower.oyako_g) * rate;
-    return { gram, pack: gram / OYAKO_PACK_GRAM };
-  }
-
-  if (type === "gokujo") {
-    const gram = lower.gokujo_g + (upper.gokujo_g - lower.gokujo_g) * rate;
-    return { gram, pack: gram / GOKUJO_PACK_GRAM };
-  }
-
-  const pack =
-    lower.karaage_pack + (upper.karaage_pack - lower.karaage_pack) * rate;
-
-  return { gram: 0, pack };
-}
-
-// ===== 親子 / 極上 / 唐揚げごとの計算ロジック本体 =====
-function calcForType(params: {
-  todayActualSales: number;
-  todayPredSales: number;
-  tomorrowSales: number;
-  dayAfterSales: number;
-  thawedNow: number; // すでに解凍済み（パック）
-  type: "oyako" | "gokujo" | "karaage";
-  usageData: UsageRow[];
-}): ResultDetail {
-  const {
-    todayActualSales,
-    todayPredSales,
-    tomorrowSales,
-    dayAfterSales,
-    thawedNow,
-    type,
-    usageData,
-  } = params;
-
-  // 今日のトータル予測・ここまでの実績
-  const todayPredUsage = getUsageBySales(todayPredSales, type, usageData);
-  const todaySoFarUsage = getUsageBySales(todayActualSales, type, usageData);
-
-  const todayPredPack = todayPredUsage.pack;
-  const todaySoFarPack = todaySoFarUsage.pack;
-
-  // 今日これから必要な分
-  const remainingTodayUse = Math.max(0, todayPredPack - todaySoFarPack);
-
-  // 明日・明後日
-  const tomorrowNeed = getUsageBySales(tomorrowSales, type, usageData).pack;
-  const dayAfterNeed = getUsageBySales(dayAfterSales, type, usageData).pack;
-
-  // 3日間で「これから」必要な合計
-  const requiredTotal = remainingTodayUse + tomorrowNeed + dayAfterNeed;
-
-  // 解凍済みを差し引いて追加解凍パック数
-  const thawToAddPack = Math.max(0, requiredTotal - thawedNow);
-
-  // 今日営業終了時点での残り目安
-  const leftoverEndOfDay = thawedNow + thawToAddPack - todayPredPack;
-
-  const detail: CalcDetail = {
-    todayPredPack,
-    todaySoFarPack,
-    remainingTodayUse,
-    leftoverEndOfDay,
-    tomorrowNeed,
-    dayAfterNeed,
-  };
-
-  const gram =
-    type === "oyako"
-      ? thawToAddPack * OYAKO_PACK_GRAM
-      : type === "gokujo"
-      ? thawToAddPack * GOKUJO_PACK_GRAM
-      : 0;
-
-  return {
-    pack: thawToAddPack,
-    gram,
-    detail,
-  };
-}
-
-// ==================== UI 本体 ====================
+// ===== 予報入力（手入力）=====
+type Plan = {
+  offset: number; // 1=明日,2=明後日...
+  sales: string; // 表示はカンマ
+  weather: WeatherKind;
+};
 
 export default function Page() {
-  const [inputs, setInputs] = useState<Inputs>({
-    todayActualSales: "",
-    todayPredSales: "",
-    tomorrowSales: "",
-    dayAfterSales: "",
-    thawedOyako: "",
-    thawedGokujo: "",
-    thawedKaraage: "",
+  // ✅ カレンダー選択の基準日
+  const [baseDate, setBaseDate] = useState<Date>(new Date());
+  const dow = baseDate.getDay();
+
+  // ===== 祝日データ =====
+  const [holidayMap, setHolidayMap] = useState<HolidayMap>({});
+  const [holidayError, setHolidayError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const m = await fetchHolidaysJP();
+        if (!cancelled) setHolidayMap(m);
+      } catch (e: any) {
+        if (!cancelled) setHolidayError(e?.message ?? "holiday load failed");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const getHolidayName = (d: Date) => holidayMap[toISODate(d)];
+  const isWeekend = (d: Date) => d.getDay() === 0 || d.getDay() === 6;
+  const isHolidayOrWeekend = (d: Date) =>
+    Boolean(getHolidayName(d)) || isWeekend(d);
+
+  // ===== 使用量テーブル =====
+  const [usageData, setUsageData] = useState<UsageRow[]>([]);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/meat_usage.json", { cache: "no-store" });
+        if (!res.ok) throw new Error(`load failed: ${res.status}`);
+        const data = (await res.json()) as UsageRow[];
+        if (!cancelled) setUsageData(Array.isArray(data) ? data : []);
+      } catch (e: any) {
+        if (!cancelled) {
+          setUsageData([]);
+          setLoadError(e?.message ?? "load failed");
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // ===== 入力 =====
+  const [thawed, setThawed] = useState({
+    oyako: "",
+    gokujo: "",
+    karaage: "",
   });
 
-  const [usageData, setUsageData] = useState<UsageRow[]>([]);
-  const [results, setResults] = useState<Results | null>(null);
+  // 明日〜4日後（天気は手入力・売上は手入力）
+  const [plans, setPlans] = useState<Plan[]>([
+    { offset: 1, sales: "", weather: "unknown" },
+    { offset: 2, sales: "", weather: "unknown" },
+    { offset: 3, sales: "", weather: "unknown" },
+    { offset: 4, sales: "", weather: "unknown" },
+  ]);
 
-  // ★ ここに既存の useEffect で usageData（表）読み込みを戻すイメージ
-  // useEffect(() => {
-  //   fetch("/usage.json")
-  //     .then((res) => res.json())
-  //     .then((data) => setUsageData(data));
-  // }, []);
+  // 金曜だけ任意スイッチ（土曜不足を見る）
+  const [includeSatOnFriday, setIncludeSatOnFriday] = useState(false);
 
-  const handleChange = (e: ChangeEvent<HTMLInputElement>) => {
-    const { name, value } = e.target;
-    const formatted = formatNumberComma(value);
-    setInputs((prev) => ({ ...prev, [name]: formatted }));
+  const setPlan = (offset: number, patch: Partial<Plan>) => {
+    setPlans((prev) =>
+      prev.map((p) => (p.offset === offset ? { ...p, ...patch } : p))
+    );
   };
 
-  const handleCalculate = () => {
-    const todayActualSales = parseNumber(inputs.todayActualSales);
-    const todayPredSales = parseNumber(inputs.todayPredSales);
-    const tomorrowSales = parseNumber(inputs.tomorrowSales);
-    const dayAfterSales = parseNumber(inputs.dayAfterSales);
+  // ===== targets生成（曜日 + 2日前ルール + 金曜スイッチ + 祝日自動判定）=====
+  const buildTargets = (): TargetDay[] => {
+    let offsets = baseOffsetsByWeekday(dow);
 
-    const thawedOyako = parseNumber(inputs.thawedOyako);
-    const thawedGokujo = parseNumber(inputs.thawedGokujo);
-    const thawedKaraage = parseNumber(inputs.thawedKaraage);
+    // 金曜：土曜不足も見る（任意）
+    if (dow === 5 && includeSatOnFriday) offsets = offsets.concat([1]);
 
-    const common = {
-      todayActualSales,
-      todayPredSales,
-      tomorrowSales,
-      dayAfterSales,
-      usageData,
-    };
+    // 2日前ルール：2日後が土日祝なら targets に必ず入れる
+    const date2 = addDays(baseDate, 2);
+    if (isHolidayOrWeekend(date2)) offsets = offsets.concat([2]);
+
+    offsets = uniqSorted(offsets);
+
+    return offsets
+      .map((off) => {
+        const p = plans.find((x) => x.offset === off);
+        if (!p) return null;
+
+        const d = addDays(baseDate, off);
+        const holidayName = getHolidayName(d);
+        const holiday = Boolean(holidayName) || isWeekend(d);
+
+        return {
+          offset: off,
+          label: `${daysJP[d.getDay()]}(${md(d)})`,
+          dateISO: toISODate(d),
+          sales: parseNum(p.sales),
+          weather: p.weather,
+          isHoliday: holiday,
+          holidayName: holidayName || undefined,
+        } as TargetDay;
+      })
+      .filter(Boolean) as TargetDay[];
+  };
+
+  // ===== 計算結果 =====
+  const [targets, setTargets] = useState<TargetDay[]>([]);
+  const [result, setResult] = useState<{
+    oyako: ReturnType<typeof calcForType>;
+    gokujo: ReturnType<typeof calcForType>;
+    karaage: ReturnType<typeof calcForType>;
+  } | null>(null);
+
+  const handleCalc = () => {
+    const t = buildTargets();
+    setTargets(t);
 
     const oyako = calcForType({
-      ...common,
-      thawedNow: thawedOyako,
       type: "oyako",
+      usageData,
+      thawedNowPack: parseNum(thawed.oyako),
+      targets: t,
+      packGram: OYAKO_PACK_GRAM,
     });
 
     const gokujo = calcForType({
-      ...common,
-      thawedNow: thawedGokujo,
       type: "gokujo",
+      usageData,
+      thawedNowPack: parseNum(thawed.gokujo),
+      targets: t,
+      packGram: GOKUJO_PACK_GRAM,
     });
 
     const karaage = calcForType({
-      ...common,
-      thawedNow: thawedKaraage,
       type: "karaage",
+      usageData,
+      thawedNowPack: parseNum(thawed.karaage),
+      targets: t,
+      karaageNeedFactor: KARAAGE_NEED_FACTOR,
     });
 
-    setResults({ oyako, gokujo, karaage });
+    setResult({ oyako, gokujo, karaage });
   };
+
+  // 表示用（未計算でも確認できるように）
+  const previewTargets = useMemo(() => {
+    try {
+      return targets.length ? targets : buildTargets();
+    } catch {
+      return [];
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [targets, baseDate, plans, includeSatOnFriday, holidayMap]);
 
   return (
     <main className="min-h-screen bg-slate-100 py-8">
-      <div className="mx-auto max-w-5xl px-4">
-        {/* ヘッダー */}
-        <header className="mb-6 flex items-center justify-between gap-4">
-          <div>
-            <h1 className="text-2xl font-semibold text-slate-900">
-              おにくたち
-            </h1>
-            <p className="mt-1 text-sm text-slate-600">
-              今日の売上・予測と解凍済み在庫から、
-              親子・極上・唐揚げの追加解凍数を自動計算
-            </p>
-          </div>
-          <div className="rounded-xl bg-slate-900 px-4 py-2 text-xs font-medium text-slate-50 shadow">
-            実務用ロジック版
-          </div>
-        </header>
-
-        <div className="grid gap-6 md:grid-cols-[1.4fr,1fr]">
-          {/* 入力エリア */}
-          <section className="space-y-4 rounded-2xl bg-white p-5 shadow-sm">
-            <h2 className="text-lg font-semibold text-slate-900">売上入力</h2>
-            <div className="grid gap-3 sm:grid-cols-2">
-              <div className="space-y-1.5">
-                <label className="text-xs font-medium text-slate-700">
-                  今日の実績売上
-                </label>
-                <input
-                  type="text"
-                  inputMode="numeric"
-                  pattern="[0-9,]*"
-                  name="todayActualSales"
-                  value={inputs.todayActualSales}
-                  onChange={handleChange}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm shadow-sm focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-100"
-                  placeholder="例）120,000"
-                />
-              </div>
-              <div className="space-y-1.5">
-                <label className="text-xs font-medium text-slate-700">
-                  今日の最終予測売上
-                </label>
-                <input
-                  type="text"
-                  inputMode="numeric"
-                  pattern="[0-9,]*"
-                  name="todayPredSales"
-                  value={inputs.todayPredSales}
-                  onChange={handleChange}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm shadow-sm focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-100"
-                  placeholder="例）150,000"
-                />
-              </div>
-              <div className="space-y-1.5">
-                <label className="text-xs font-medium text-slate-700">
-                  明日の予測売上
-                </label>
-                <input
-                  type="text"
-                  inputMode="numeric"
-                  pattern="[0-9,]*"
-                  name="tomorrowSales"
-                  value={inputs.tomorrowSales}
-                  onChange={handleChange}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm shadow-sm focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-100"
-                  placeholder="例）130,000"
-                />
-              </div>
-              <div className="space-y-1.5">
-                <label className="text-xs font-medium text-slate-700">
-                  明後日の予測売上
-                </label>
-                <input
-                  type="text"
-                  inputMode="numeric"
-                  pattern="[0-9,]*"
-                  name="dayAfterSales"
-                  value={inputs.dayAfterSales}
-                  onChange={handleChange}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm shadow-sm focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-100"
-                  placeholder="例）110,000"
-                />
-              </div>
-            </div>
-
-            <h2 className="mt-4 text-lg font-semibold text-slate-900">
-              解凍済み在庫（パック）
-            </h2>
-            <div className="grid gap-3 sm:grid-cols-3">
-              <div className="space-y-1.5">
-                <label className="text-xs font-medium text-slate-700">
-                  親子 解凍済み
-                </label>
-                <input
-                  type="text"
-                  inputMode="numeric"
-                  pattern="[0-9,]*"
-                  name="thawedOyako"
-                  value={inputs.thawedOyako}
-                  onChange={handleChange}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm shadow-sm focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-100"
-                  placeholder="例）3"
-                />
-              </div>
-              <div className="space-y-1.5">
-                <label className="text-xs font-medium text-slate-700">
-                  極上 解凍済み
-                </label>
-                <input
-                  type="text"
-                  inputMode="numeric"
-                  pattern="[0-9,]*"
-                  name="thawedGokujo"
-                  value={inputs.thawedGokujo}
-                  onChange={handleChange}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm shadow-sm focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-100"
-                  placeholder="例）2"
-                />
-              </div>
-              <div className="space-y-1.5">
-                <label className="text-xs font-medium text-slate-700">
-                  唐揚げ 解凍済み
-                </label>
-                <input
-                  type="text"
-                  inputMode="numeric"
-                  pattern="[0-9,]*"
-                  name="thawedKaraage"
-                  value={inputs.thawedKaraage}
-                  onChange={handleChange}
-                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm shadow-sm focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-100"
-                  placeholder="例）4"
-                />
-              </div>
-            </div>
-
-            <div className="mt-4 flex justify-end">
-              <button
-                type="button"
-                onClick={handleCalculate}
-                className="inline-flex items-center gap-2 rounded-xl bg-sky-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-sky-700 focus:outline-none focus:ring-2 focus:ring-sky-300 focus:ring-offset-1"
+      <div className="mx-auto max-w-5xl px-4 space-y-6">
+        {/* Header / Calendar */}
+        <section className="rounded-2xl bg-white p-5 shadow">
+          <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <div>
+              <h1 className="text-2xl font-semibold">おにくたち（解凍計算）</h1>
+              <p className="text-sm text-slate-600">
+                📅 選択日：{baseDate.getFullYear()}年{baseDate.getMonth() + 1}月
+                {baseDate.getDate()}日（{daysJP[dow]}）
+                {getHolidayName(baseDate)
+                  ? `【${getHolidayName(baseDate)}】`
+                  : ""}
+                {isWeekend(baseDate) ? "（週末）" : ""}
+              </p>
+              <p
+                className={`mt-1 text-xs ${
+                  loadError ? "text-rose-600" : "text-slate-500"
+                }`}
               >
-                解凍数を計算
-              </button>
+                {loadError
+                  ? `対応表エラー: ${loadError}`
+                  : `対応表: ${usageData.length} 行`}
+              </p>
+              <p
+                className={`mt-1 text-xs ${
+                  holidayError ? "text-rose-600" : "text-slate-500"
+                }`}
+              >
+                {holidayError
+                  ? `祝日APIエラー: ${holidayError}`
+                  : `祝日判定: 自動`}
+              </p>
             </div>
-          </section>
 
-          {/* 結果エリア */}
-          <section className="space-y-4">
-            <div className="rounded-2xl bg-white p-5 shadow-sm">
-              <h2 className="mb-3 text-lg font-semibold text-slate-900">
-                追加で解凍する数
-              </h2>
-              {results ? (
-                <div className="space-y-3">
-                  <ResultCard title="親子" result={results.oyako} unitGram />
-                  <ResultCard title="極上" result={results.gokujo} unitGram />
-                  <ResultCard
-                    title="唐揚げ"
-                    result={results.karaage}
-                    unitGram={false}
+            <div className="flex flex-col gap-2 items-start md:items-end">
+              <div className="flex items-center gap-2">
+                <label className="text-sm text-slate-700">基準日</label>
+                <input
+                  type="date"
+                  value={toISODate(baseDate)}
+                  onChange={(e) => {
+                    const d = new Date(e.target.value);
+                    if (!isNaN(d.getTime())) setBaseDate(d);
+                  }}
+                  className="rounded-lg border px-3 py-2 text-sm"
+                />
+              </div>
+
+              {dow === 5 && (
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={includeSatOnFriday}
+                    onChange={(e) => setIncludeSatOnFriday(e.target.checked)}
                   />
-                </div>
-              ) : (
-                <p className="text-sm text-slate-500">
-                  売上と解凍済み在庫を入力して「解凍数を計算」を押す
-                </p>
+                  金曜：土曜不足も考慮
+                </label>
               )}
             </div>
-          </section>
-        </div>
+          </div>
+        </section>
+
+        {/* Inputs */}
+        <section className="rounded-2xl bg-white p-5 shadow space-y-4">
+          <h2 className="font-semibold">解凍済み在庫（pack）</h2>
+          <div className="grid gap-3 sm:grid-cols-3">
+            <Field
+              label="親子"
+              value={thawed.oyako}
+              onChange={(v) =>
+                setThawed((p) => ({ ...p, oyako: fmtComma(parseNum(v)) }))
+              }
+            />
+            <Field
+              label="極上"
+              value={thawed.gokujo}
+              onChange={(v) =>
+                setThawed((p) => ({ ...p, gokujo: fmtComma(parseNum(v)) }))
+              }
+            />
+            <Field
+              label="唐揚げ"
+              value={thawed.karaage}
+              onChange={(v) =>
+                setThawed((p) => ({ ...p, karaage: fmtComma(parseNum(v)) }))
+              }
+            />
+          </div>
+
+          <h2 className="font-semibold mt-2">明日以降の予想（売上・天気）</h2>
+
+          <div className="grid gap-3 md:grid-cols-2">
+            {plans.map((p) => {
+              const d = addDays(baseDate, p.offset);
+              const holidayName = getHolidayName(d);
+              const holiday = Boolean(holidayName) || isWeekend(d);
+
+              const label = `${p.offset}日後：${daysJP[d.getDay()]}(${md(d)})`;
+              return (
+                <div
+                  key={p.offset}
+                  className="rounded-xl border bg-slate-50 p-3 space-y-2"
+                >
+                  <div className="flex items-center justify-between">
+                    <div className="text-sm font-semibold">
+                      {label} {holiday ? "（祝/休）" : ""}
+                      {holidayName ? `【${holidayName}】` : ""}
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="space-y-1">
+                      <div className="text-xs text-slate-700">予想売上</div>
+                      <input
+                        value={p.sales}
+                        inputMode="numeric"
+                        onChange={(e) =>
+                          setPlan(p.offset, {
+                            sales: fmtComma(parseNum(e.target.value)),
+                          })
+                        }
+                        className="w-full rounded-lg border bg-white px-3 py-2 text-sm"
+                        placeholder="例: 240,000"
+                      />
+                    </div>
+
+                    <div className="space-y-1">
+                      <div className="text-xs text-slate-700">
+                        天気（手入力）
+                      </div>
+                      <select
+                        value={p.weather}
+                        onChange={(e) =>
+                          setPlan(p.offset, {
+                            weather: e.target.value as WeatherKind,
+                          })
+                        }
+                        className="w-full rounded-lg border bg-white px-3 py-2 text-sm"
+                      >
+                        <option value="unknown">不明</option>
+                        <option value="sun">晴</option>
+                        <option value="cloud">曇</option>
+                        <option value="rain">雨</option>
+                        <option value="snow">雪</option>
+                        <option value="storm">荒</option>
+                      </select>
+                      <div className="text-[11px] text-slate-500">
+                        補正：雨0.9 / 雪0.8 / 荒0.85（calcForType側）
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="flex justify-end">
+            <button
+              onClick={handleCalc}
+              disabled={!usageData.length}
+              className="rounded-xl bg-sky-600 px-4 py-2 text-white font-semibold disabled:opacity-50"
+            >
+              解凍数を計算
+            </button>
+          </div>
+        </section>
+
+        {/* Targets preview */}
+        <section className="rounded-2xl bg-white p-5 shadow">
+          <h2 className="font-semibold mb-2">今回仕込む日（targets）</h2>
+          <div className="flex flex-wrap gap-2">
+            {previewTargets.map((t) => (
+              <span
+                key={t.offset}
+                className="rounded-full border bg-slate-50 px-3 py-1 text-xs"
+              >
+                {t.label}
+                {t.isHoliday ? "（祝/休）" : ""}
+                {t.holidayName ? `【${t.holidayName}】` : ""}
+                {" / "}
+                {weatherLabel[t.weather]}
+                {" / "}
+                {fmtComma(t.sales)}円
+              </span>
+            ))}
+            {!previewTargets.length && (
+              <span className="text-xs text-slate-500">
+                targets がありません（入力を確認）
+              </span>
+            )}
+          </div>
+        </section>
+
+        {/* Result */}
+        <section className="rounded-2xl bg-white p-5 shadow">
+          <h2 className="font-semibold mb-3">追加で解凍</h2>
+
+          {result ? (
+            <div className="space-y-4">
+              <div className="grid gap-3 sm:grid-cols-3">
+                <ResultBox label="親子" pack={result.oyako.addPack} />
+                <ResultBox label="極上" pack={result.gokujo.addPack} />
+                <ResultBox label="唐揚げ" pack={result.karaage.addPack} />
+              </div>
+
+              <details className="text-sm">
+                <summary className="cursor-pointer text-slate-700">
+                  計算の内訳
+                </summary>
+
+                <div className="mt-3 grid gap-3 md:grid-cols-3">
+                  <NeedBox title="親子" r={result.oyako} />
+                  <NeedBox title="極上" r={result.gokujo} />
+                  <NeedBox title="唐揚げ" r={result.karaage} />
+                </div>
+              </details>
+            </div>
+          ) : (
+            <p className="text-sm text-slate-500">
+              入力して「解凍数を計算」を押す
+            </p>
+          )}
+        </section>
       </div>
     </main>
   );
 }
 
-// ===== 結果カードコンポーネント =====
-function ResultCard({
-  title,
-  result,
-  unitGram,
+// ===== Components =====
+function Field({
+  label,
+  value,
+  onChange,
 }: {
-  title: string;
-  result: ResultDetail;
-  unitGram: boolean;
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
 }) {
-  const d = result.detail;
-  const baseColor =
-    title === "親子" ? "sky" : title === "極上" ? "amber" : "emerald";
+  return (
+    <div className="space-y-1">
+      <label className="text-xs text-slate-700">{label}</label>
+      <input
+        type="text"
+        inputMode="numeric"
+        pattern="[0-9,.-]*"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full rounded-lg border px-3 py-2 text-sm"
+        placeholder="例: 3"
+      />
+    </div>
+  );
+}
+
+function ResultBox({ label, pack }: { label: string; pack: number }) {
+  const p = safeNum(pack, 0);
+  return (
+    <div className="rounded-xl bg-slate-50 p-4 border text-center">
+      <div className="text-sm text-slate-600">{label}</div>
+      <div className="text-4xl font-bold">{fmtComma(p)}</div>
+      <div className="text-xs text-slate-500">pack</div>
+    </div>
+  );
+}
+
+function NeedBox({ title, r }: { title: string; r: any }) {
+  const peak = safeNum(r?.detail?.peakNeedPack, 0);
+  const thawed = safeNum(r?.detail?.thawedNowPack, 0);
+  const targets = Array.isArray(r?.detail?.targets) ? r.detail.targets : [];
+  const chosen = r?.detail?.chosen ?? null;
 
   return (
-    <div className="rounded-2xl border border-slate-100 bg-slate-50 px-4 py-3 shadow-inner">
-      <div className="flex items-center justify-between">
-        <h3 className="text-sm font-semibold text-slate-800">{title}</h3>
-        <span
-          className={`rounded-full bg-${baseColor}-100 px-3 py-1 text-xs font-semibold text-${baseColor}-800`}
-        >
-          追加 {result.pack.toFixed(2)} パック
-          {unitGram && (
-            <span className="ml-1 text-[11px] text-slate-500">
-              （約 {Math.round(result.gram)} g）
-            </span>
-          )}
-        </span>
+    <div className="rounded-xl border bg-slate-50 p-3">
+      <div className="font-semibold text-sm">{title}</div>
+
+      <div className="mt-1 text-xs text-slate-700">
+        目標在庫（ピーク）: {peak.toFixed(2)} pack
       </div>
-      <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-[11px] text-slate-600">
-        <div>
-          <dt className="text-slate-400">今日の予測</dt>
-          <dd>{d.todayPredPack.toFixed(2)} pack</dd>
+      <div className="text-xs text-slate-700">
+        解凍済み: {thawed.toFixed(2)} pack
+      </div>
+
+      {chosen && (
+        <div className="mt-1 text-xs text-slate-600">
+          採用: {chosen.label}（必要 {safeNum(chosen.needPack, 0).toFixed(2)}{" "}
+          pack）
         </div>
-        <div>
-          <dt className="text-slate-400">ここまでの使用</dt>
-          <dd>{d.todaySoFarPack.toFixed(2)} pack</dd>
-        </div>
-        <div>
-          <dt className="text-slate-400">今日これから</dt>
-          <dd>{d.remainingTodayUse.toFixed(2)} pack</dd>
-        </div>
-        <div>
-          <dt className="text-slate-400">明日分</dt>
-          <dd>{d.tomorrowNeed.toFixed(2)} pack</dd>
-        </div>
-        <div>
-          <dt className="text-slate-400">明後日分</dt>
-          <dd>{d.dayAfterNeed.toFixed(2)} pack</dd>
-        </div>
-        <div>
-          <dt className="text-slate-400">今日閉店時の残り目安</dt>
-          <dd>{d.leftoverEndOfDay.toFixed(2)} pack</dd>
-        </div>
-      </dl>
+      )}
+
+      <div className="mt-2 space-y-1">
+        {targets.map((t: any, i: number) => (
+          <div key={i} className="rounded-lg bg-white border p-2 text-xs">
+            <div className="font-semibold">{t.label}</div>
+            <div className="text-slate-600">
+              売上 {fmtComma(safeNum(t.rawSales, 0))} → 補正{" "}
+              {fmtComma(safeNum(t.adjustedSales, 0))}
+              {" / "}
+              必要 {safeNum(t.needPack, 0).toFixed(2)} pack
+              {" / "}
+              天気係数 {safeNum(t.weatherFactor, 1).toFixed(2)}
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
