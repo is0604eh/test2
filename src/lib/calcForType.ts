@@ -1,11 +1,13 @@
-// src/lib/calcForType.ts
-// 完成形（ピーク方式 + 現場換算）
-// ✅ targets は合算せず「最大（ピーク）」を満たす
-// ✅ 天気補正（雨0.9 / 雪0.8 / 荒0.85）
-// ✅ oyako/gokujo: usageのgを packGram で pack換算
-// ✅ karaage: usageのpackに karaageNeedFactor を掛けて調整（例: 0.9）
-
-export type MeatType = "oyako" | "gokujo" | "karaage";
+// calcForType.ts
+// 曜日無視
+// 入力：営業終了後の総量（段＋pack）、売上予想（明日・明後日・明々後日）
+// 表：meat_usage.json の「最も近い sales 行」を採用
+//
+// 表示したい式（あなたの指定）に合わせた計算：
+// ① S - d1 = left
+// ② d2 - left = short（※short = max(d2 - left, 0)）
+// ③ d3 + short = thaw（明日の朝に溶かす量）
+// 出力：kg と pack（端数OK）
 
 export type UsageRow = {
   sales: number;
@@ -14,160 +16,112 @@ export type UsageRow = {
   karaage_pack: number;
 };
 
-export type WeatherKind = "sun" | "cloud" | "rain" | "snow" | "storm" | "unknown";
-
-export type TargetDay = {
-  offset: number;
-  label: string; // 例: 日(12/28)
-  dateISO: string; // YYYY-MM-DD
-  sales: number; // 円
-  weather: WeatherKind;
-  isHoliday: boolean;
-  holidayName?: string;
+export type InventoryInput = {
+  oyako: { dan: number; pack: number };
+  gokujo: { dan: number; pack: number };
+  karaage: { dan: number; pack: number };
 };
 
-export type TargetNeed = {
-  label: string;
-  dateISO: string;
-  rawSales: number;
-  adjustedSales: number;
-  needPack: number;
-  weatherFactor: number;
+export type OneMeat = {
+  stockKg: number;
+
+  d1: number;
+  d2: number;
+  d3: number;
+
+  used1: number;
+  used2: number;
+  used3: number;
+
+  left: number;   // S - d1
+  short: number;  // max(d2 - left, 0)
+
+  thawKg: number;   // d3 + short
+  thawPack: number; // thawKg / 2
 };
 
-export type ResultDetail = {
-  addPack: number;
-  addGram: number; // oyako/gokujo用（参考）
-  detail: {
-    thawedNowPack: number;
-    peakNeedPack: number;
-    targets: TargetNeed[];
-    chosen: { label: string; dateISO: string; adjustedSales: number; needPack: number } | null;
-    factors: {
-      packGramUsed?: number;
-      karaageNeedFactorUsed?: number;
-    };
+export type CalcResult = {
+  oyako: OneMeat;
+  gokujo: OneMeat;
+  karaage: OneMeat;
+};
+
+const KG_PER_PACK = 2;
+const KG_PER_DAN = 3;
+const KARAAGE_KG_PER_DAN = 6;
+
+const r1 = (n: number) => Math.round(n * 10) / 10;
+
+const clamp0 = (n: number) => Math.max(0, Number.isFinite(n) ? n : 0);
+
+function nearestRow(data: UsageRow[], sales: number): UsageRow {
+  if (!data.length) return { sales, oyako_g: 0, gokujo_g: 0, karaage_pack: 0 };
+  return data.reduce((best, cur) =>
+    Math.abs(cur.sales - sales) < Math.abs(best.sales - sales) ? cur : best
+  );
+}
+
+function invToKg(inv: InventoryInput) {
+  return {
+    oyako: clamp0(inv.oyako.dan) * KG_PER_DAN + clamp0(inv.oyako.pack) * KG_PER_PACK,
+    gokujo: clamp0(inv.gokujo.dan) * KG_PER_DAN + clamp0(inv.gokujo.pack) * KG_PER_PACK,
+    karaage:
+      clamp0(inv.karaage.dan) * KARAAGE_KG_PER_DAN + clamp0(inv.karaage.pack) * KG_PER_PACK,
   };
-};
+}
 
-// ===== utils =====
-const clamp0 = (n: number) => (Number.isFinite(n) ? Math.max(0, n) : 0);
+function needKg(row: UsageRow) {
+  return {
+    oyako: (row.oyako_g ?? 0) / 1000,
+    gokujo: (row.gokujo_g ?? 0) / 1000,
+    karaage: (row.karaage_pack ?? 0) * KG_PER_PACK,
+  };
+}
 
-const getKey = (type: MeatType): keyof UsageRow => {
-  if (type === "oyako") return "oyako_g";
-  if (type === "gokujo") return "gokujo_g";
-  return "karaage_pack";
-};
-
-export const weatherFactor = (w: WeatherKind) => {
-  if (w === "rain") return 0.9;
-  if (w === "snow") return 0.8;
-  if (w === "storm") return 0.85;
-  return 1.0;
-};
-
-// usage表から必要量（線形補間）
-const needFromSalesRaw = (usage: UsageRow[], sales: number, type: MeatType): number => {
-  const s = clamp0(sales);
-  if (!usage.length) return 0;
-
-  const rows = [...usage].sort((a, b) => a.sales - b.sales);
-  const key = getKey(type);
-
-  if (s <= rows[0].sales) return rows[0][key];
-  if (s >= rows.at(-1)!.sales) return rows.at(-1)![key];
-
-  const exact = rows.find((r) => r.sales === s);
-  if (exact) return exact[key];
-
-  for (let i = 0; i < rows.length - 1; i++) {
-    const lo = rows[i];
-    const hi = rows[i + 1];
-    if (lo.sales < s && s < hi.sales) {
-      const t = (s - lo.sales) / (hi.sales - lo.sales);
-      return lo[key] + (hi[key] - lo[key]) * t;
-    }
-  }
-  return rows.at(-1)![key];
-};
-
-export const calcForType = (params: {
-  type: MeatType;
-  usageData: UsageRow[];
-  thawedNowPack: number;
-  targets: TargetDay[];
-
-  // ★現場換算パラメータ
-  packGram?: number; // oyako/gokujo: 1pack何gか
-  karaageNeedFactor?: number; // karaage: 必要packに掛ける係数（例: 0.9）
-}): ResultDetail => {
-  const {
-    type,
-    usageData,
-    thawedNowPack,
-    targets,
-    packGram = 1000,
-    karaageNeedFactor = 1.0,
-  } = params;
-
-  const thawed = clamp0(thawedNowPack);
-
-  const needs: TargetNeed[] = targets.map((t) => {
-    const wf = weatherFactor(t.weather);
-    const adjustedSales = Math.round(clamp0(t.sales) * wf);
-
-    const rawNeed = needFromSalesRaw(usageData, adjustedSales, type);
-
-    let needPack =
-      type === "karaage" ? rawNeed * karaageNeedFactor : rawNeed / packGram;
-
-    needPack = clamp0(needPack);
-
-    const holidaySuffix = t.isHoliday ? "（祝/休）" : "";
-    const label = t.holidayName
-      ? `${t.label}${holidaySuffix}【${t.holidayName}】`
-      : `${t.label}${holidaySuffix}`;
-
-    return {
-      label,
-      dateISO: t.dateISO,
-      rawSales: clamp0(t.sales),
-      adjustedSales,
-      needPack,
-      weatherFactor: wf,
-    };
-  });
-
-  // ピーク（最大）を採用
-  let peakNeedPack = 0;
-  let chosen: ResultDetail["detail"]["chosen"] = null;
-
-  for (const n of needs) {
-    if (n.needPack >= peakNeedPack) {
-      peakNeedPack = n.needPack;
-      chosen = {
-        label: n.label,
-        dateISO: n.dateISO,
-        adjustedSales: n.adjustedSales,
-        needPack: n.needPack,
-      };
-    }
-  }
-
-  const addPack = Math.max(0, Math.ceil(peakNeedPack - thawed));
+function calcOne(S: number, d1: number, d2: number, d3: number, u1: number, u2: number, u3: number): OneMeat {
+  const left = S - d1;
+  const short = Math.max(d2 - left, 0);
+  const thawKg = d3 + short;
 
   return {
-    addPack,
-    addGram: type === "karaage" ? 0 : addPack * packGram,
-    detail: {
-      thawedNowPack: thawed,
-      peakNeedPack,
-      targets: needs,
-      chosen,
-      factors: {
-        packGramUsed: type === "karaage" ? undefined : packGram,
-        karaageNeedFactorUsed: type === "karaage" ? karaageNeedFactor : undefined,
-      },
-    },
+    stockKg: r1(S),
+
+    d1: r1(d1),
+    d2: r1(d2),
+    d3: r1(d3),
+
+    used1: u1,
+    used2: u2,
+    used3: u3,
+
+    left: r1(left),
+    short: r1(short),
+
+    thawKg: r1(thawKg),
+    thawPack: r1(thawKg / KG_PER_PACK),
   };
-};
+}
+
+export function calculate(args: {
+  inventory: InventoryInput;
+  salesTomorrow: number;
+  salesDayAfter: number;
+  salesTwoDaysAfter: number;
+  usageData: UsageRow[];
+}): CalcResult {
+  const S = invToKg(args.inventory);
+
+  const row1 = nearestRow(args.usageData, args.salesTomorrow);
+  const row2 = nearestRow(args.usageData, args.salesDayAfter);
+  const row3 = nearestRow(args.usageData, args.salesTwoDaysAfter);
+
+  const n1 = needKg(row1);
+  const n2 = needKg(row2);
+  const n3 = needKg(row3);
+
+  return {
+    oyako: calcOne(S.oyako, n1.oyako, n2.oyako, n3.oyako, row1.sales, row2.sales, row3.sales),
+    gokujo: calcOne(S.gokujo, n1.gokujo, n2.gokujo, n3.gokujo, row1.sales, row2.sales, row3.sales),
+    karaage: calcOne(S.karaage, n1.karaage, n2.karaage, n3.karaage, row1.sales, row2.sales, row3.sales),
+  };
+}
